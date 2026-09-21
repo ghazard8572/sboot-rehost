@@ -170,7 +170,8 @@ def check_bypass(workdir):
 # is documentation of a bypass, not the machine forging console output.
 HOST_DIAG = re.compile(
     r"\b(?:error_report|info_report|warn_report|error_setg|qemu_log|qemu_log_mask|"
-    r"fprintf|printf|assert|g_assert)\b[^;]*;", re.S)
+    r'fprintf|printf|assert|g_assert)\b'
+    r'(?:"(?:[^"\\]|\\.)*"|[^;])*;', re.S)
 
 # Strings that name QEMU objects - MemoryRegions, properties, the machine type.
 # "itmon" as a MemoryRegion name is the device being modelled, not the machine
@@ -179,7 +180,8 @@ HOST_DIAG = re.compile(
 QEMU_NAMING = re.compile(
     r"\b(?:memory_region_init\w*|object_property_\w+|object_initialize\w*|object_new|"
     r"qdev_\w+|sysbus_\w+|type_register\w*|MACHINE_TYPE_NAME|blk_by_name|"
-    r"qemu_chr_new|qemu_chr_fe_init|machine_class_\w+)\b[^;]*;", re.S)
+    r'qemu_chr_new|qemu_chr_fe_init|machine_class_\w+)\b'
+    r'(?:"(?:[^"\\]|\\.)*"|[^;])*;', re.S)
 DESC_ASSIGN = re.compile(r"->(?:desc|name|fw_name)\s*=\s*\"(?:[^\"\\]|\\.)*\"", re.S)
 
 
