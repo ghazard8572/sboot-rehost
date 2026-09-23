@@ -40,11 +40,15 @@ Usage:
 Output: JSON on stdout + <workdir>/verdict_script.json
 """
 import argparse
+import bz2
 import glob
 import json
+import lzma
 import os
 import re
+import subprocess
 import sys
+import zlib
 
 # The four bypass fields, written with optional markdown emphasis and, for the
 # side-effect field, the longer "알려진 부작용" wording that real workspaces use.
@@ -165,54 +169,175 @@ def check_bypass(workdir):
     return False, f"{os.path.basename(path)}: 항목 수가 어긋납니다 {counts}"
 
 
-# Diagnostics the machine writes to QEMU's own stderr - never to the guest UART.
+# --- C source tokenising -----------------------------------------------------
+# Item 1 asks one question: does the machine print firmware text to the GUEST
+# console? Three kinds of text are not that, and counting them produced false
+# leaks on a machine that was genuinely clean:
+#   - comments and #include paths (never output at all)
+#   - error_report / qemu_log arguments (QEMU's own stderr, not the UART)
+#   - QEMU object names: MemoryRegion labels, properties, mc->desc
+#
+# Those three used to be cut out with `\b(name|...)\b[^;]*;` applied to the raw
+# source, and that cannot work - not because the pattern was too loose, but
+# because a regex over raw C has no way to tell a `;` that ends a statement from
+# a `;` inside a string literal. On `error_report("-ENODEV; ...")` the match
+# stops at the literal's own semicolon, so the rest of the statement stays
+# behind with its closing quote missing; from there every quote pairs with the
+# wrong partner and the extracted literal set is garbage. Measured on one
+# machine source: 41 matches ended inside a literal, the quote count went from
+# 2,208 after comment removal to 583 (an odd number) after the filters, and the
+# final literal set was 178. Item 1 could then both pass a machine that leaks
+# and fail one that does not.
+#
+# So the order is inverted, exactly as the defect report asked: tokenise once,
+# then filter. `_scan_source` masks comment text and literal bodies in place -
+# same offsets, so a span found in the masked text names the same span in the
+# source - and no `;`, `(`, `)` or `"` inside a comment or a literal is visible
+# to anything that runs afterwards.
+#
+# The filters are still regexes, but they now match a NAME ONLY. The span they
+# remove is the call's own parenthesis pair, counted in the masked text, not
+# "everything up to the next semicolon". That is what keeps a filter from
+# swallowing whatever else shares the statement.
+
+
+def _scan_source(src):
+    """Tokenise C source once.
+
+    Returns `(masked, literals)`:
+
+      masked    the same length as `src`, with comment text and the *bodies* of
+                string and character literals replaced by spaces (newlines kept
+                so line numbers and `^`/`$` still line up).
+      literals  `[(start, end, value)]` per string literal, `start`/`end`
+                bracketing the quotes. Adjacent literals separated only by
+                whitespace are merged, because C concatenates them: a machine
+                that wrote `"S-BOOT " "# "` emits one string, and scoring the
+                halves separately would let a leak slip under the length floor.
+    """
+    out = list(src)
+    found = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            end = src.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            for k in range(i, end):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = end
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            end = src.find("\n", i)
+            end = n if end < 0 else end
+            for k in range(i, end):
+                out[k] = " "
+            i = end
+            continue
+        if c in "\"'":
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == c:
+                    break
+                # An unterminated literal must not eat the rest of the file.
+                if src[j] == "\n" and c == "'":
+                    break
+                j += 1
+            body_end = min(j, n)
+            for k in range(i + 1, body_end):
+                if src[k] != "\n":
+                    out[k] = " "
+            if c == '"':
+                found.append([i, min(j + 1, n), src[i + 1:body_end]])
+            i = min(j + 1, n)
+            continue
+        i += 1
+
+    masked = "".join(out)
+    merged = []
+    for lit in found:
+        if merged and not masked[merged[-1][1]:lit[0]].strip():
+            merged[-1][1] = lit[1]
+            merged[-1][2] += lit[2]
+        else:
+            merged.append(lit)
+    return masked, [tuple(x) for x in merged]
+
+
+# Host-side diagnostics: written to QEMU's own stderr, never to the guest UART.
 # A patch-site report naming a firmware symbol ("exynos_read_is_device_unlocked")
 # is documentation of a bypass, not the machine forging console output.
-HOST_DIAG = re.compile(
-    r"\b(?:error_report|info_report|warn_report|error_setg|qemu_log|qemu_log_mask|"
-    r"fprintf|printf|assert|g_assert)\b[^;]*;", re.S)
+HOST_DIAG_FN = (r"error_report|info_report|warn_report|error_setg|qemu_log|"
+                r"qemu_log_mask|fprintf|printf|assert|g_assert")
 
 # Strings that name QEMU objects - MemoryRegions, properties, the machine type.
 # "itmon" as a MemoryRegion name is the device being modelled, not the machine
 # printing "itmon" to the guest; the model name appears in mc->desc for the same
 # reason it appears in the firmware's own banner.
-QEMU_NAMING = re.compile(
-    r"\b(?:memory_region_init\w*|object_property_\w+|object_initialize\w*|object_new|"
-    r"qdev_\w+|sysbus_\w+|type_register\w*|MACHINE_TYPE_NAME|blk_by_name|"
-    r"qemu_chr_new|qemu_chr_fe_init|machine_class_\w+)\b[^;]*;", re.S)
-DESC_ASSIGN = re.compile(r"->(?:desc|name|fw_name)\s*=\s*\"(?:[^\"\\]|\\.)*\"", re.S)
+QEMU_NAMING_FN = (r"memory_region_init\w*|object_property_\w+|object_initialize\w*|"
+                  r"object_new|qdev_\w+|sysbus_\w+|type_register\w*|"
+                  r"MACHINE_TYPE_NAME|blk_by_name|qemu_chr_new|qemu_chr_fe_init|"
+                  r"machine_class_\w+")
+
+EXCLUDED_CALLS = re.compile(rf"\b(?:{HOST_DIAG_FN}|{QEMU_NAMING_FN})\s*\(")
+DESC_ASSIGN = re.compile(r"->\s*(?:desc|name|fw_name)\s*=\s*$")
+INCLUDE_LINE = re.compile(r"^\s*#\s*include\s*$")
+
+
+def _call_arg_spans(masked):
+    """`(start, end)` of the argument list of every excluded call.
+
+    Scoped to the call's OWN parentheses, counted in the masked text so a
+    parenthesis inside a literal cannot close it. The old patterns ran to the
+    next `;` instead, which took whatever else shared the statement with the
+    call - the reported fdt-helper case reached 309 characters and carried a
+    neighbouring property name out with it.
+
+    An unbalanced call (a truncated file) yields nothing rather than a span
+    running to EOF: dropping every literal after a stray `(` would make item 1
+    pass vacuously, which is the failure this whole check exists to prevent.
+    """
+    spans, n = [], len(masked)
+    for m in EXCLUDED_CALLS.finditer(masked):
+        depth, i = 0, m.end() - 1
+        while i < n:
+            if masked[i] == "(":
+                depth += 1
+            elif masked[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    spans.append((m.end(), i))
+                    break
+            i += 1
+    return spans
+
+
+def machine_literals(path):
+    """The string literals in a machine source that could reach the guest console."""
+    masked, literals = _scan_source(read_text(path))
+    drop = _call_arg_spans(masked)
+    kept = []
+    for start, _end, value in literals:
+        if any(lo <= start < hi for lo, hi in drop):
+            continue
+        line_start = masked.rfind("\n", 0, start) + 1
+        if INCLUDE_LINE.match(masked[line_start:start]):   # #include "qemu/osdep.h"
+            continue
+        # Bounded lookback, not the line, so `mc->desc =` broken across lines
+        # still matches its literal.
+        if DESC_ASSIGN.search(masked[max(0, start - 120):start]):
+            continue
+        kept.append(value)
+    return kept
 
 
 def code_literals(path):
-    """Return the C string literals that could reach the *guest* console.
-
-    Item 1 asks whether the machine prints firmware text to the guest. Three
-    kinds of text are not that, and counting them produced false leaks on a
-    machine that was genuinely clean:
-      - comments and #include paths (never output at all)
-      - error_report/info_report/qemu_log arguments (QEMU stderr, not the UART)
-      - QEMU object names: MemoryRegion labels, properties, mc->desc
-    """
-    src = read_text(path)
-    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)      # block comments
-    src = re.sub(r"//[^\n]*", " ", src)                    # line comments
-    src = re.sub(r"^\s*#\s*include[^\n]*", " ", src, flags=re.M)
-    src = HOST_DIAG.sub(" ", src)                          # host-side diagnostics
-    src = QEMU_NAMING.sub(" ", src)                        # object / region names
-    src = DESC_ASSIGN.sub(" ", src)                        # mc->desc et al
-    return " ".join(re.findall(r'"((?:[^"\\]|\\.)*)"', src))
-
-
-def code_literals_raw(path):
-    """The same filtering, but returning the source so literals stay delimited."""
-    src = read_text(path)
-    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
-    src = re.sub(r"//[^\n]*", " ", src)
-    src = re.sub(r"^\s*#\s*include[^\n]*", " ", src, flags=re.M)
-    src = HOST_DIAG.sub(" ", src)
-    src = QEMU_NAMING.sub(" ", src)
-    src = DESC_ASSIGN.sub(" ", src)
-    return src
+    """The same literals as one blob, for callers that only test membership."""
+    return " ".join(machine_literals(path))
 
 
 def check_source_negative(sources, console_bytes):
@@ -235,7 +360,7 @@ def check_source_negative(sources, console_bytes):
     console = console_bytes.decode("latin-1", errors="replace")
     leaked = []
     for path in sources:
-        for literal in re.findall(r'"((?:[^"\\]|\\.)*)"', code_literals_raw(path)):
+        for literal in machine_literals(path):
             # printf-style formats print differently than they are written, so
             # compare the longest literal run between conversions.
             for piece in re.split(r"%[-+ #0-9.*hlLzjt]*[a-zA-Z%]", literal):
@@ -482,28 +607,161 @@ FIXED_WORD = re.compile(rb"[A-Za-z][A-Za-z_]{3,}")
 # is not produced by sboot.bin alone - ldfw, tzsw, the ACPM firmware and the DTB
 # all print through the same UART, and their strings live in their own files.
 IMAGE_DIRS = ("03_bootloader", "02_unpacked", "fw")
-IMAGE_MAX = 128 * 1024 * 1024          # skip super.img / lu0.img sized backing stores
+
+# Text that belongs to the workspace, not to the device. Everything else is
+# offered to the scanner. This used to be a whitelist of .bin/.img/.dtb/"", and
+# that is how Image.lz4 and ramdisk.lz4 - the two files holding the kernel's and
+# userspace's own strings - were dropped before anything looked at them.
+IMAGE_EXT_SKIP = {".md", ".txt", ".json", ".jsonl", ".log", ".yaml", ".yml",
+                  ".c", ".h", ".py", ".sh", ".patch", ".diff", ".html", ".csv",
+                  ".xml", ".pyc"}
+
+IMAGE_MAX = 512 * 1024 * 1024          # one member, read into memory
+IMAGE_TOTAL_MAX = 2 * 1024 * 1024 * 1024
+DECOMP_MAX = 256 * 1024 * 1024         # decompressed output per member
+DECOMP_MIN = 1024                      # below this, the magic was a coincidence
+DECOMP_MAX_TRIES = 64
+
+COMPRESSED_MAGIC = (
+    (b"\x1f\x8b\x08", "gzip"),
+    (b"\x04\x22\x4d\x18", "lz4"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
+    (b"BZh", "bzip2"),
+)
+
+
+def _cli_decompress(argv, data, cap):
+    """Decompress through the vendor tool.
+
+    lz4 has no stdlib decoder and check_env.sh already requires the binary, so
+    for the format that actually matters here this is the path that runs.
+    Trailing data after the frame makes these tools exit non-zero while still
+    writing every byte they decoded, and a boot.img is exactly that shape - so
+    the output is what counts, not the exit code.
+    """
+    try:
+        proc = subprocess.run(argv, input=data, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return b""
+    return (proc.stdout or b"")[:cap]
+
+
+def _inflate(kind, data, cap):
+    """One compressed stream, decompressed up to `cap` bytes.
+
+    Every decoder here tolerates trailing data, because the stream is usually
+    followed by the next member of the container rather than by EOF.
+    """
+    try:
+        if kind == "gzip":
+            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(data, cap)
+        if kind == "xz":
+            return lzma.LZMADecompressor().decompress(data, max_length=cap)
+        if kind == "bzip2":
+            return bz2.BZ2Decompressor().decompress(data, max_length=cap)
+        if kind == "lz4":
+            try:
+                import lz4.frame
+                return lz4.frame.LZ4FrameDecompressor().decompress(data)[:cap]
+            except ImportError:
+                return _cli_decompress(["lz4", "-d", "-c", "-"], data, cap)
+        if kind == "zstd":
+            try:
+                from compression import zstd as _zstd        # Python 3.14+
+                return _zstd.ZstdDecompressor().decompress(data)[:cap]
+            except ImportError:
+                pass
+            try:
+                import zstandard
+                return zstandard.ZstdDecompressor().decompressobj().decompress(data)[:cap]
+            except ImportError:
+                return _cli_decompress(["zstd", "-d", "-c", "-"], data, cap)
+    except Exception:
+        # A coincidental magic is the normal case, not an error worth failing on.
+        return b""
+    return b""
+
+
+def expand_firmware(label, data):
+    """The blob, plus every compressed member inside it.
+
+    A boot.img is a header followed by a kernel and a ramdisk, each compressed
+    on its own, so the lines the kernel and userspace print are not in the file
+    as bytes at all. Comparing the console against the file as it sits on disk
+    reports them missing - that is the whole of the reported gate 2 failure
+    (82.2% on a console that was entirely genuine).
+
+    Members are found by magic at any offset, not by extension, because inside a
+    container they start wherever the previous member ended. A magic that is
+    really just two matching bytes decodes to nothing, which is why a member has
+    to yield DECOMP_MIN bytes before it counts.
+
+    One level only. A cpio inside the ramdisk that is itself compressed is not
+    unpacked; if that turns out to matter, it is a second call here, not a
+    different design.
+    """
+    out = [(label, data)]
+    budget, tries = DECOMP_MAX, DECOMP_MAX_TRIES
+    for magic, kind in COMPRESSED_MAGIC:
+        pos = 0
+        while budget > 0 and tries > 0:
+            at = data.find(magic, pos)
+            if at < 0:
+                break
+            pos = at + 1
+            tries -= 1
+            plain = _inflate(kind, data[at:], budget)
+            if len(plain) < DECOMP_MIN:
+                continue
+            budget -= len(plain)
+            out.append((f"{label}:{kind}@0x{at:x}", plain))
+    return out
 
 
 def firmware_images(workdir, extra):
-    """Every firmware component whose strings the console may contain."""
-    blobs, seen = [], set()
+    """Every firmware component whose strings the console may contain.
+
+    Returns `(images, skipped)`. `images` is `[(label, bytes)]`; `skipped` names
+    the files left out and why, so a failing gate 2 points at its own cause
+    instead of silently comparing against less than it should have.
+    """
+    images, skipped, seen = [], [], set()
+    total = 0
+
+    def take(path, forced):
+        nonlocal total
+        size = os.path.getsize(path)
+        name = os.path.basename(path)
+        # A file the caller named explicitly is never dropped for size: it is
+        # the reference set, not a candidate.
+        if not forced and size > IMAGE_MAX:
+            skipped.append(f"{name}({size // (1024 * 1024)}MiB — 단일 한도 초과)")
+            return
+        if not forced and total + size > IMAGE_TOTAL_MAX:
+            skipped.append(f"{name}(총량 한도 초과)")
+            return
+        total += size
+        images.extend(expand_firmware(name, read_bytes(path)))
+
     for path in extra:
         if path and os.path.isfile(path):
-            seen.add(os.path.realpath(path))
-            blobs.append(read_bytes(path))
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            take(path, True)
     for sub in IMAGE_DIRS:
         for path in sorted(glob.glob(os.path.join(workdir, sub, "*"))):
             real = os.path.realpath(path)
             if real in seen or not os.path.isfile(path):
                 continue
-            if os.path.getsize(path) > IMAGE_MAX:
-                continue
-            if os.path.splitext(path)[1].lower() not in (".bin", ".img", ".dtb", ""):
+            if os.path.splitext(path)[1].lower() in IMAGE_EXT_SKIP:
                 continue
             seen.add(real)
-            blobs.append(read_bytes(path))
-    return blobs
+            take(path, False)
+    return images, skipped
 
 
 # A console the machine invented would fail to match almost everywhere. A handful
@@ -512,32 +770,56 @@ def firmware_images(workdir, extra):
 # firmware), and an exported kit may not carry all of them.
 ORIGIN_MIN_RATIO = 0.98
 
+# The same shape as FIXED_WORD, run over the images to index them once.
+IMAGE_WORD = re.compile(rb"[A-Za-z][A-Za-z_]{3,}")
 
-def check_output_origin(console, images):
+
+def check_output_origin(console, images, skipped=()):
     """Every fixed string on the console must exist inside a firmware image.
 
     This is the load-bearing anti-fabrication check: if the machine (or an agent
     editing it) invented console text, the words will not be in any binary.
+
+    `images` is `[(label, bytes)]` from firmware_images, or bare blobs from the
+    legacy fallback.
     """
     words = set(FIXED_WORD.findall(console))
-    blobs = [b for b in images if b]
+    blobs = []
+    for entry in images:
+        data = entry[1] if isinstance(entry, tuple) else entry
+        if data:
+            blobs.append(data)
     if not words:
         return False, "콘솔에서 고정 문자열을 찾지 못했습니다 — 대조할 것이 없습니다"
     if not blobs:
         return False, "대조할 펌웨어 이미지가 없습니다 (--container 또는 02_unpacked/)"
+
+    # Index every image word once, then test membership, instead of scanning
+    # every blob for every console word. The scan was O(words x bytes), which
+    # was affordable only while the image set was small - and it was small
+    # because compressed members were being dropped. A word that is not a token
+    # here can still be a substring of a longer one ("boot" inside "reboot"), so
+    # the miss list falls back to the original search and the verdict is
+    # unchanged by the speed-up.
+    index = set()
+    for blob in blobs:
+        index.update(IMAGE_WORD.findall(blob))
     missing = sorted(w.decode("latin-1") for w in words
-                     if not any(b.find(w) >= 0 for b in blobs))
+                     if w not in index and not any(b.find(w) >= 0 for b in blobs))
+
     found = len(words) - len(missing)
     ratio = found / len(words)
+    note = f" · 제외된 파일: {', '.join(skipped[:5])}" if skipped else ""
     if not missing:
         return True, (f"고정 문자열 {len(words)} 개가 모두 펌웨어 이미지 "
-                      f"{len(blobs)} 개 안에 있습니다 (런타임 조립분은 대조 대상이 아닙니다)")
+                      f"{len(blobs)} 개 안에 있습니다 (런타임 조립분은 대조 대상이 아닙니다)"
+                      + note)
     detail = (f"고정 문자열 {len(words)} 개 중 {found} 개 확인 ({ratio:.1%}), "
               f"{len(missing)} 개 미발견: {missing[:10]} — 이미지 {len(blobs)} 개와 대조")
     if ratio >= ORIGIN_MIN_RATIO:
-        return True, detail + f" · {ORIGIN_MIN_RATIO:.0%} 이상이라 통과"
+        return True, detail + f" · {ORIGIN_MIN_RATIO:.0%} 이상이라 통과" + note
     return False, (detail + " — 지어낸 출력이거나, 같은 UART 를 쓰는 다른 펌웨어 성분"
-                   "(ldfw·tzsw·ACPM)이 02_unpacked/ 에 없습니다")
+                   "(ldfw·tzsw·ACPM)이 02_unpacked/ 에 없습니다" + note)
 
 
 def check_input_origin(sources):
@@ -550,10 +832,13 @@ def check_input_origin(sources):
         return False, "머신 소스를 찾지 못해 입력 경로를 확인할 수 없습니다"
     hits = []
     for path in sources:
-        src = read_text(path)
-        src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
-        src = re.sub(r"//[^\n]*", " ", src)
-        for m in RX_SEED.finditer(src):
+        # Comments are removed by the tokeniser, not by a regex over the raw
+        # source. `re.sub(r"//[^\n]*", ...)` treats the `//` inside a literal
+        # like "http://host/path" as the start of a comment and blanks the rest
+        # of the line - which here can blank a real rx_seed() call and let gate 3
+        # pass a machine that types to itself.
+        masked, _ = _scan_source(read_text(path))
+        for m in RX_SEED.finditer(masked):
             hits.append(f"{os.path.basename(path)}:{m.group(1)}")
     if hits:
         return False, (f"머신이 자기 수신 버퍼를 채웁니다: {hits[:5]} — "
@@ -587,8 +872,9 @@ def verify_full(workdir, args):
                   "pass": ok, "evidence": detail})
 
     # --- GATE 2: the console came out of the firmware ----------------------
-    images = firmware_images(workdir, [args.container, getattr(args, "kernel", None)])
-    ok, detail = check_output_origin(console, images or [container, kernel])
+    images, skipped = firmware_images(workdir,
+                                      [args.container, getattr(args, "kernel", None)])
+    ok, detail = check_output_origin(console, images or [container, kernel], skipped)
     items.append({"n": 2, "gate": True,
                   "name": "출력 출처 (콘솔 고정 문자열이 펌웨어 안에 존재)",
                   "pass": ok, "evidence": detail})
